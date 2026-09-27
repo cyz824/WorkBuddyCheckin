@@ -4,13 +4,15 @@ WorkBuddy 签到助手 - 单文件 EXE 版 (v1.1)
 功能：全机多账号签到 / 开机自启签到 / 每日多时间点签到 / 签到日志
 用法：双击打开控制台（GUI）；--checkin 无头签到；--apply 按 config.json 注册计划任务
 """
-import sys, os, json, time, ctypes, argparse, datetime, subprocess, tempfile, re
+import sys, os, json, time, ctypes, argparse, datetime, subprocess, tempfile, re, base64, hashlib, shutil
 
 APP_NAME   = "WorkBuddy-AutoCheckin"
+MIGRATION_TASKS = ["WorkBuddy-AutoCheckin-User1", "WorkBuddy-AutoCheckin-User2"]   # 修复期临时任务，注册主任务后自动清理
 APP_TITLE  = "WorkBuddy 签到助手"
-APP_VER    = "1.1.0"
+APP_VER    = "1.4.0"
 APP_ID     = "WorkBuddy.CheckinAssistant"   # 任务栏图标分组
 TOOL_DIR   = r"C:\ProgramData\WorkBuddyCheckin"
+USER_TOOL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "WorkBuddyCheckin")
 LOG_DIR    = os.path.join(TOOL_DIR, "logs")
 CONFIG     = os.path.join(TOOL_DIR, "config.json")
 LASTRUN    = os.path.join(TOOL_DIR, "last-run.json")
@@ -24,9 +26,127 @@ SKIP_USERS = {"Public", "Default", "Default User", "All Users"}
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
+def ensure_tool_dir_writable():
+    """ProgramData 下的工具目录常由 SYSTEM/管理员先创建，普通用户会写失败。
+    可写性探测失败时尝试用 icacls 给 Users 组补修改权限（需管理员/SYSTEM，失败静默）。"""
+    def probe():
+        try:
+            t = os.path.join(LOG_DIR, ".wtest")
+            with open(t, "w") as f:
+                f.write("ok")
+            os.remove(t)
+            return True
+        except Exception:
+            return False
+    if probe():
+        return
+    try:
+        subprocess.run(["icacls", TOOL_DIR, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/C", "/Q"],
+                       capture_output=True, timeout=60)
+    except Exception:
+        pass
+
 def resource_path(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
+
+# ---------------- WorkBuddy 凭据字段解密（$wbEncrypted） ----------------
+# 新版 WorkBuddy 把 auth 文件中的 nickname/phoneNumber/accessToken/refreshToken
+# 加密为 {"$wbEncrypted":1,"envelope":<base64 JSON>}，算法为 AES-256-GCM：
+#   key    = sha256(atRestSecretKey字符串utf8)          （32B）
+#   keyId  = sha256(key).hex[:16]
+#   AAD    = b"WB-AAD\0" + 0x01 + lp("WBEV1") + lp("sym-v1") + u32be(1) + lp(keyId) + 0x02 + 0x00 + 0x00
+# atRestSecretKey 由 WorkBuddy（定制 Electron）内置 binding 提供，
+# 这里用 ELECTRON_RUN_AS_NODE 启动 WorkBuddy.exe 调 loggerGet() 获取，不落盘。
+_WB_AAD_PREFIX = b"WB-AAD\0"
+_WB_KEY_CACHE = {"key": None, "key_id": None, "tried": False}
+_WB_JS = "process.stdout.write(process._linkedBinding('electron_browser_workbuddy_storage').loggerGet())"
+
+def find_workbuddy_exe():
+    cands = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WorkBuddy", "WorkBuddy.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "WorkBuddy", "WorkBuddy.exe"),
+        r"D:\workbuddy\workbuddy\WorkBuddy.exe",
+    ]
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+def get_wb_key():
+    """返回 (aes_key_bytes, keyId)；拿不到返回 (None, None)。"""
+    if _WB_KEY_CACHE["tried"]:
+        return _WB_KEY_CACHE["key"], _WB_KEY_CACHE["key_id"]
+    _WB_KEY_CACHE["tried"] = True
+    exe = find_workbuddy_exe()
+    if not exe:
+        log("未找到 WorkBuddy.exe，无法解密新版加密凭据", "WARN")
+        return None, None
+    try:
+        env = dict(os.environ, ELECTRON_RUN_AS_NODE="1")
+        r = subprocess.run([exe, "-e", _WB_JS], capture_output=True, timeout=60, env=env)
+        payload = json.loads((r.stdout or b"").decode("utf-8", "replace"))
+        secret = payload.get("atRestSecretKey")
+        if not secret:
+            raise ValueError("no atRestSecretKey")
+        key = hashlib.sha256(secret.encode("utf-8")).digest()
+        key_id = hashlib.sha256(key).hexdigest()[:16]
+        _WB_KEY_CACHE["key"], _WB_KEY_CACHE["key_id"] = key, key_id
+        return key, key_id
+    except Exception as e:
+        log("获取 WorkBuddy 解密密钥失败: %s" % e, "WARN")
+        return None, None
+
+def _wb_b64d(s):
+    return base64.b64decode(s + "=" * ((4 - len(s) % 4) % 4))
+
+def _wb_field_aad(key_id):
+    def lp(s):
+        b = s.encode("utf-8")
+        return len(b).to_bytes(4, "big") + b
+    return (_WB_AAD_PREFIX + b"\x01" + lp("WBEV1") + lp("sym-v1")
+            + (1).to_bytes(4, "big") + lp(key_id) + b"\x02\x00\x00")
+
+def wb_unwrap(value):
+    """把可能被 $wbEncrypted 加密的字段还原为明文字符串；明文原样返回；失败返回 None。"""
+    if isinstance(value, str):
+        return value
+    if not (isinstance(value, dict) and value.get("$wbEncrypted") == 1):
+        return None
+    key, _ = get_wb_key()
+    if not key:
+        return None
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        e = json.loads(_wb_b64d(value["envelope"]))
+        pt = AESGCM(key).decrypt(_wb_b64d(e["nonce"]),
+                                 _wb_b64d(e["ciphertext"]) + _wb_b64d(e["authTag"]),
+                                 _wb_field_aad(e["keyId"]))
+        return pt.decode("utf-8")
+    except Exception:
+        return None
+
+def wb_wrap(new_value, old_field):
+    """回写 token 时保持原字段形态：原来是 $wbEncrypted 就重新加密，否则明文。"""
+    if not (isinstance(old_field, dict) and old_field.get("$wbEncrypted") == 1):
+        return new_value
+    _, key_id = get_wb_key()
+    key = _WB_KEY_CACHE["key"]
+    if not key:
+        return new_value
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        nonce = os.urandom(12)
+        a = AESGCM(key)
+        ct = a.encrypt(nonce, new_value.encode("utf-8"), _wb_field_aad(key_id))
+        env = {"suite": 1, "keyId": key_id,
+               "nonce": base64.b64encode(nonce).decode(),
+               "authTag": base64.b64encode(ct[-16:]).decode(),
+               "ciphertext": base64.b64encode(ct[:-16]).decode()}
+        return {"$wbEncrypted": 1,
+                "envelope": base64.b64encode(json.dumps(env, separators=(",", ":")).encode("utf-8")).decode()}
+    except Exception:
+        return new_value
 
 # ---------------- 日志 ----------------
 def log(msg, lvl="INFO"):
@@ -86,11 +206,15 @@ def find_accounts(include_backups=False):
                 if not uid or uid in seen:
                     continue
                 seen.add(uid)
-                nick = data["account"].get("nickname") or data["account"].get("phoneNumber") or uid[:8]
+                nick = (wb_unwrap(data["account"].get("nickname"))
+                        or wb_unwrap(data["account"].get("phoneNumber")) or uid[:8])
+                auth = data.get("auth", {})
+                tok = wb_unwrap(auth.get("accessToken"))
+                ref = wb_unwrap(auth.get("refreshToken"))
                 accounts.append({
                     "name": "%s/%s" % (wu, nick), "win_user": wu, "nick": nick,
                     "uid": uid, "backup": fn != "workbuddy-desktop.info",
-                    "file": path, "data": data,
+                    "file": path, "data": data, "tok": tok, "ref": ref,
                 })
             except Exception:
                 continue
@@ -102,7 +226,7 @@ requests.packages.urllib3.disable_warnings()
 
 def api_headers(acc):
     return {"Content-Type": "application/json", "Accept": "application/json",
-            "Authorization": "Bearer " + acc["data"]["auth"]["accessToken"],
+            "Authorization": "Bearer " + (acc.get("tok") or ""),
             "X-User-Id": acc["uid"], "X-Domain": acc["data"]["auth"].get("domain", "www.workbuddy.cn")}
 
 def wait_network(max_minutes=5):
@@ -124,9 +248,9 @@ def wait_network(max_minutes=5):
 
 def refresh_token(acc):
     auth = acc["data"].get("auth", {})
-    rt = auth.get("refreshToken")
+    rt = acc.get("ref") or wb_unwrap(auth.get("refreshToken"))
     if not rt:
-        log("[%s] 无 refreshToken" % acc["name"], "ERROR")
+        log("[%s] 无 refreshToken（凭据可能已加密且无法解密）" % acc["name"], "ERROR")
         return False
     h = {"Content-Type": "application/json", "X-User-Id": acc["uid"],
          "X-Domain": auth.get("domain", "www.workbuddy.cn"),
@@ -135,8 +259,14 @@ def refresh_token(acc):
         r = requests.post(API_BASE + EP_REFRESH, headers=h, json={}, timeout=30, verify=False)
         j = r.json()
         if j.get("code") == 0 and j.get("data"):
-            auth.update({k: j["data"][k] for k in
-                         ("accessToken", "refreshToken", "expiresAt", "refreshExpiresAt") if k in j["data"]})
+            d = j["data"]
+            for k in ("accessToken", "refreshToken"):
+                if k in d:
+                    auth[k] = wb_wrap(d[k], auth.get(k))
+                    acc["tok" if k == "accessToken" else "ref"] = d[k]
+            for k in ("expiresAt", "refreshExpiresAt"):
+                if k in d:
+                    auth[k] = d[k]
             auth["lastRefreshTime"] = int(time.time() * 1000)
             with open(acc["file"], "w", encoding="utf-8") as f:
                 json.dump(acc["data"], f, ensure_ascii=False)
@@ -183,6 +313,9 @@ def claim_checkin(acc):
 def process_account(acc, retry=3, delay=30):
     name = acc["name"]
     log("===== %s =====" % name)
+    if not acc.get("tok") and not acc.get("ref"):
+        log("[%s] 凭据已加密且无法解密（请确认 WorkBuddy 安装完整）" % name, "ERROR")
+        return {"user": name, "ok": False, "msg": "凭据加密无法解密"}
     if not ensure_token(acc):
         return {"user": name, "ok": False, "msg": "Token 刷新失败"}
     st = get_status(acc)
@@ -215,11 +348,35 @@ def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def save_json(path, obj):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
+    def _write(p):
+        with open(p, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=1)
+    ok = False
+    try:
+        _write(path)
+        ok = True
     except Exception as e:
         log("写入 %s 失败: %s" % (path, e), "ERROR")
+    if not ok:   # ProgramData 不可写（普通用户）时镜像到用户目录，读取侧兜底
+        try:
+            os.makedirs(USER_TOOL_DIR, exist_ok=True)
+            _write(os.path.join(USER_TOOL_DIR, os.path.basename(path)))
+        except Exception:
+            pass
+
+def read_state(fname):
+    """读取 ProgramData 与用户镜像中较新的状态文件（accounts.json / last-run.json 等）"""
+    best, best_m = None, -1.0
+    for p in (os.path.join(TOOL_DIR, fname), os.path.join(USER_TOOL_DIR, fname)):
+        try:
+            m = os.path.getmtime(p)
+            if m > best_m:
+                with open(p, encoding="utf-8-sig") as f:
+                    best = json.load(f)
+                best_m = m
+        except Exception:
+            continue
+    return best
 
 def save_accounts(accs):
     save_json(ACCOUNTS, [{"name": a["name"], "win_user": a["win_user"], "nick": a["nick"],
@@ -281,20 +438,29 @@ def build_triggers_xml(cfg):
 def task_exe_path():
     """计划任务使用固定路径的 EXE：必要时把自身复制到 ProgramData（防止源 EXE 被移动后任务失效）"""
     dst = os.path.join(TOOL_DIR, "WorkBuddyCheckin.exe")
+    if not getattr(sys, "frozen", False):
+        return os.path.abspath(__file__)   # 源码运行时计划任务直接指向本脚本的解释器路径无效，返回自身供报错提示
     try:
         cur = os.path.abspath(sys.executable)
         if cur.lower() != dst.lower():
             if not os.path.exists(dst) or os.path.getmtime(cur) > os.path.getmtime(dst):
-                import shutil
                 shutil.copyfile(cur, dst)
         return dst
     except Exception:
         return sys.executable
 
-def apply_tasks():
-    """按 config.json 注册/更新/删除计划任务（需管理员）"""
-    cfg = load_config()
+def apply_tasks(cfg=None):
+    """按 config.json 注册/更新/删除计划任务（需管理员）；cfg 传入时先落盘（供普通用户提权保存设置）"""
+    if cfg is not None:
+        try:
+            save_config(cfg)
+        except Exception as e:
+            write_setup_result(False, "配置写入失败: %s" % e)
+            return 1
+    cfg = cfg or load_config()
     trig = build_triggers_xml(cfg)
+    for tn in MIGRATION_TASKS:   # 清理修复期临时任务（存在则删，不报错）
+        subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True)
     try:
         if not trig:
             subprocess.run(["schtasks", "/delete", "/tn", APP_NAME, "/f"], capture_output=True)
@@ -363,48 +529,60 @@ def wait_result(path, timeout=180):
 # ============================================================
 def run_gui():
     from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                                   QLabel, QPushButton, QListWidget, QLineEdit, QPlainTextEdit,
-                                   QFrame, QScrollArea, QMessageBox, QAbstractButton, QProgressBar,
+                                   QLabel, QPushButton, QGridLayout, QLineEdit, QPlainTextEdit,
+                                   QFrame, QMessageBox, QAbstractButton, QProgressBar,
                                    QGraphicsDropShadowEffect)
-    from PySide6.QtCore import Qt, QThread, Signal, QPropertyAnimation, Property, QSize
-    from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QPainterPath
+    from PySide6.QtCore import Qt, QThread, Signal, QPropertyAnimation, Property
+    from PySide6.QtGui import QFont, QIcon, QPainter, QColor, QPainterPath
 
-    C = dict(BG="#161923", CARD="#212637", BORDER="#2E3550", TXT="#E8EAF2", SUB="#98A0B8",
-             ACCENT="#5B8DEF", ACCENT_H="#74A1F2", GREEN="#3FB68B", RED="#E5534B", YELLOW="#D9A13B")
+    C = dict(BG="#F5F6F8", CARD="#FFFFFF", ROW="#F7F8FA", LINE="#E5E6EB",
+             TXT="#1F2329", SUB="#646A73", FAINT="#8F959E",
+             ACCENT="#3370FF", ACCENT_H="#2860E1", ACCENT_SOFT="#EEF3FF",
+             GREEN="#2BA245", RED="#E5484D", ORANGE="#D97706", OFF="#D8DBE0")
 
     QSS = """
-        QMainWindow, QWidget { background: %(BG)s; color: %(TXT)s;
-            font-family: 'Segoe UI', 'Microsoft YaHei'; font-size: 13px; }
-        QFrame#card { background: %(CARD)s; border: 1px solid %(BORDER)s; border-radius: 14px; }
-        QLabel#appname { font-size: 18px; font-weight: bold; }
-        QLabel#ver { color: %(SUB)s; font-size: 11px; }
-        QLabel#h { font-size: 14px; font-weight: bold; }
-        QLabel#sub { color: %(SUB)s; font-size: 12px; }
-        QLabel#badge { font-size: 11px; padding: 4px 12px; border-radius: 10px; }
-        QPushButton { background: #333B59; border: none; border-radius: 9px;
-                      padding: 9px 18px; color: %(TXT)s; }
-        QPushButton:hover { background: #404A73; }
-        QPushButton:pressed { background: #2C3350; }
-        QPushButton:disabled { color: #6B7390; background: #2A3049; }
-        QPushButton#accent { background: %(ACCENT)s; color: #0E1220; font-weight: bold; }
-        QPushButton#accent:hover { background: %(ACCENT_H)s; }
-        QPushButton#accent:pressed { background: #4A7AD6; }
-        QLineEdit { background: #161923; border: 1px solid %(BORDER)s; border-radius: 8px;
-                    padding: 7px 10px; color: %(TXT)s; selection-background-color: %(ACCENT)s; }
+        QMainWindow#root { background: %(BG)s; }
+        QWidget { color: %(TXT)s; font-family: 'Segoe UI', 'Microsoft YaHei'; font-size: 13px; }
+        QLabel#h2 { font-size: 14px; font-weight: 700; }
+        QLabel#sub { color: %(SUB)s; font-size: 11.5px; }
+        QLabel#faint { color: %(FAINT)s; font-size: 11px; }
+        QLabel#badge { font-size: 11px; padding: 3px 10px; border-radius: 9px; }
+        QFrame#card { background: %(CARD)s; border: none; border-radius: 14px; }
+        QFrame#accRow { background: %(ROW)s; border: none; border-radius: 10px; }
+        QPushButton { background: %(CARD)s; border: 1px solid #DEE0E3; border-radius: 9px;
+                      padding: 7px 16px; color: %(TXT)s; font-size: 12.5px; }
+        QPushButton:hover { background: #F0F1F5; border-color: #C9CDD4; }
+        QPushButton:pressed { background: #E8EAEF; }
+        QPushButton:disabled { color: #B5BAC3; background: %(BG)s; border-color: %(LINE)s; }
+        QPushButton#cta { background: %(ACCENT)s; color: #FFFFFF; border: none;
+                          border-radius: 11px; font-size: 15px; font-weight: 700; padding: 12px; }
+        QPushButton#cta:hover { background: #4B82FF; }
+        QPushButton#cta:pressed { background: %(ACCENT_H)s; }
+        QPushButton#cta:disabled { background: #BCCCFF; color: #FFFFFF; }
+        QPushButton#save { background: %(CARD)s; border: 1px solid %(ACCENT)s; border-radius: 9px;
+                           color: %(ACCENT)s; font-weight: 600; }
+        QPushButton#save:hover { background: %(ACCENT_SOFT)s; border-color: %(ACCENT)s; }
+        QPushButton#save:pressed { background: #E0EAFF; }
+        QPushButton#tiny { background: transparent; border: none; border-radius: 8px;
+                           padding: 5px 10px; font-size: 11.5px; color: %(SUB)s; }
+        QPushButton#tiny:hover { background: #EDEEF2; color: %(TXT)s; }
+        QPushButton#chip { background: %(ACCENT_SOFT)s; border: none; border-radius: 13px;
+                           padding: 6px 14px; color: %(ACCENT)s; font-size: 12px; }
+        QPushButton#chip:hover { background: #E0EAFF; }
+        QLineEdit { background: %(CARD)s; border: 1px solid #DEE0E3; border-radius: 9px;
+                    padding: 7px 10px; color: %(TXT)s; selection-background-color: #D6E4FF; }
         QLineEdit:focus { border: 1px solid %(ACCENT)s; }
-        QListWidget { background: #161923; border: 1px solid %(BORDER)s; border-radius: 8px; padding: 4px; }
-        QListWidget::item { padding: 4px 8px; border-radius: 5px; }
-        QListWidget::item:selected { background: %(ACCENT)s; color: #0E1220; }
-        QPlainTextEdit { background: #12141D; border: 1px solid %(BORDER)s; border-radius: 8px;
-                         font-family: Consolas, 'Microsoft YaHei'; font-size: 11px; color: %(SUB)s; padding: 6px; }
-        QProgressBar { background: #2A3049; border: none; border-radius: 3px; max-height: 6px; }
-        QProgressBar::chunk { background: %(ACCENT)s; border-radius: 3px; }
-        QScrollArea { border: none; }
+        QPlainTextEdit { background: %(ROW)s; border: none; border-radius: 10px;
+                         font-family: Consolas, 'Microsoft YaHei'; font-size: 11px;
+                         color: %(SUB)s; padding: 10px; selection-background-color: #D6E4FF; }
+        QProgressBar { background: #E5E6EB; border: none; max-height: 3px; }
+        QProgressBar::chunk { background: %(ACCENT)s; }
         QScrollBar:vertical { background: transparent; width: 10px; margin: 4px 2px; }
-        QScrollBar::handle:vertical { background: #3A4266; border-radius: 4px; min-height: 30px; }
-        QScrollBar::handle:vertical:hover { background: #4A5480; }
+        QScrollBar::handle:vertical { background: #C9CDD4; border-radius: 5px; min-height: 30px; }
+        QScrollBar::handle:vertical:hover { background: #A8ABB2; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QToolTip { background: #2A3049; color: %(TXT)s; border: 1px solid %(BORDER)s; padding: 4px 8px; }
+        QToolTip { background: %(CARD)s; color: %(TXT)s; border: 1px solid %(LINE)s;
+                   padding: 5px 9px; border-radius: 6px; }
     """ % C
 
     class Toggle(QAbstractButton):
@@ -414,7 +592,7 @@ def run_gui():
             self.setCheckable(True)
             self.setChecked(checked)
             self.setCursor(Qt.PointingHandCursor)
-            self.setFixedSize(46, 26)
+            self.setFixedSize(44, 25)
             self._pos = 1.0 if checked else 0.0
             self._anim = QPropertyAnimation(self, b"knob", self)
             self._anim.setDuration(140)
@@ -436,18 +614,17 @@ def run_gui():
             w, h = self.width(), self.height()
             path = QPainterPath()
             path.addRoundedRect(1, 1, w - 2, h - 2, (h - 2) / 2, (h - 2) / 2)
-            # 轨道颜色随开关过渡
-            off = QColor("#3A4266"); on = QColor(C["ACCENT"])
+            off = QColor(C["OFF"]); on = QColor(C["ACCENT"])
             t = self._pos
             col = QColor(int(off.red() + (on.red() - off.red()) * t),
                          int(off.green() + (on.green() - off.green()) * t),
                          int(off.blue() + (on.blue() - off.blue()) * t))
             p.fillPath(path, col)
-            d = h - 8
-            x = 4 + self._pos * (w - 8 - d)
+            d = h - 6
+            x = 3 + self._pos * (w - 6 - d)
             p.setBrush(QColor("#FFFFFF"))
             p.setPen(Qt.NoPen)
-            p.drawEllipse(int(x), 4, d, d)
+            p.drawEllipse(int(x), 3, d, d)
             p.end()
 
     class Worker(QThread):
@@ -461,116 +638,169 @@ def run_gui():
             except Exception as e:
                 self.done.emit(e)
 
+    def rgba(color, alpha):
+        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+        return "rgba(%d,%d,%d,%s)" % (r, g, b, alpha)
+
     def badge(text, color):
         lb = QLabel(text)
         lb.setObjectName("badge")
-        lb.setStyleSheet("color: %s; background: %s26;" % (color, color))
+        lb.setStyleSheet("color: %s; background: %s;" % (color, rgba(color, "0.10")))
         return lb
+
+    def make_card(title=None):
+        f = QFrame()
+        f.setObjectName("card")
+        sh = QGraphicsDropShadowEffect()
+        sh.setBlurRadius(28)
+        sh.setOffset(0, 4)
+        sh.setColor(QColor(31, 35, 41, 18))
+        f.setGraphicsEffect(sh)
+        lay = QVBoxLayout(f)
+        lay.setContentsMargins(22, 18, 22, 20)
+        lay.setSpacing(12)
+        if title:
+            lb = QLabel(title)
+            lb.setObjectName("h2")
+            lay.addWidget(lb)
+        return f, lay
+
+    def toggle_row(text, toggle):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
+        lb = QLabel(text)
+        h.addWidget(lb)
+        h.addStretch(1)
+        h.addWidget(toggle)
+        return w
 
     class Win(QMainWindow):
         def __init__(self):
             super().__init__()
+            self.setObjectName("root")
             self.setWindowTitle("%s v%s" % (APP_TITLE, APP_VER))
             self.setWindowIcon(QIcon(resource_path("app.ico")))
-            self.setMinimumSize(660, 720)
-            self.resize(700, 800)
+            self.setMinimumSize(880, 600)
+            self.resize(940, 680)
             self.setStyleSheet(QSS)
 
-            scroll = QScrollArea(); scroll.setWidgetResizable(True)
-            root = QWidget(); lay = QVBoxLayout(root)
-            lay.setContentsMargins(20, 20, 20, 16); lay.setSpacing(14)
+            root = QWidget()
+            self.setCentralWidget(root)
+            vbox = QVBoxLayout(root)
+            vbox.setContentsMargins(0, 0, 0, 0)
+            vbox.setSpacing(0)
 
-            # ---------- 头部 ----------
-            head = QHBoxLayout()
-            iconLb = QLabel()
-            pm = QPixmap(resource_path("app.ico"))
-            if not pm.isNull():
-                iconLb.setPixmap(pm.scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            nameBox = QVBoxLayout(); nameBox.setSpacing(0)
-            nm = QLabel(APP_TITLE); nm.setObjectName("appname")
-            ver = QLabel("v%s · 多账号自动签到" % APP_VER); ver.setObjectName("ver")
-            nameBox.addWidget(nm); nameBox.addWidget(ver)
-            self.adminBadge = badge("管理员" if is_admin() else "普通模式", C["GREEN"] if is_admin() else C["YELLOW"])
-            head.addWidget(iconLb); head.addSpacing(12); head.addLayout(nameBox)
-            head.addStretch(1); head.addWidget(self.adminBadge)
-            lay.addLayout(head)
-
-            # ---------- 账号 ----------
-            c1, v1 = self.card("本机 WorkBuddy 账号")
-            self.accLabel = QLabel("读取中…"); self.accLabel.setWordWrap(True)
-            self.accLabel.setTextFormat(Qt.RichText)
-            v1.addWidget(self.accLabel)
-            lay.addWidget(c1)
-
-            # ---------- 立即签到 ----------
-            c2, v2 = self.card("立即签到")
-            row = QHBoxLayout()
-            self.hint = QLabel("为全部账号签到（会弹出一次管理员授权）")
-            self.hint.setObjectName("sub"); self.hint.setWordWrap(True)
-            self.btnNow = QPushButton("立即签到"); self.btnNow.setObjectName("accent")
-            self.btnNow.setFixedSize(130, 40)
-            row.addWidget(self.hint, 1); row.addWidget(self.btnNow)
-            v2.addLayout(row)
-            lay.addWidget(c2)
-
-            # ---------- 自动签到设置 ----------
-            c3, v3 = self.card("自动签到设置")
-            r1 = QHBoxLayout()
-            r1.addWidget(QLabel("开机 / 登录时自动签到一次")); r1.addStretch(1)
-            self.tgBoot = Toggle()
-            r1.addWidget(self.tgBoot)
-            v3.addLayout(r1)
-            r2 = QHBoxLayout()
-            lb2 = QLabel("同时签到历史切换过的账号（一般不用开）"); lb2.setObjectName("sub")
-            r2.addWidget(lb2); r2.addStretch(1)
-            self.tgBackups = Toggle()
-            r2.addWidget(self.tgBackups)
-            v3.addLayout(r2)
-            sub = QLabel("每日定时签到（格式 HH:mm，可添加多个）"); sub.setObjectName("sub")
-            v3.addWidget(sub)
-            tr = QHBoxLayout()
-            self.timeEdit = QLineEdit("12:00"); self.timeEdit.setFixedWidth(90)
-            bAdd = QPushButton("＋ 添加"); bDel = QPushButton("－ 删除选中")
-            tr.addWidget(self.timeEdit); tr.addWidget(bAdd); tr.addWidget(bDel); tr.addStretch(1)
-            v3.addLayout(tr)
-            self.timeList = QListWidget(); self.timeList.setFixedHeight(90)
-            v3.addWidget(self.timeList)
-            sr = QHBoxLayout()
-            self.taskLabel = QLabel(""); self.taskLabel.setObjectName("sub")
-            self.btnSave = QPushButton("保存设置"); self.btnSave.setObjectName("accent")
-            self.btnSave.setFixedSize(130, 38)
-            sr.addWidget(self.taskLabel, 1); sr.addWidget(self.btnSave)
-            v3.addLayout(sr)
-            lay.addWidget(c3)
-
-            # ---------- 上次运行 ----------
-            c4, v4 = self.card("上次运行")
-            self.lastLabel = QLabel("--"); self.lastLabel.setObjectName("sub")
-            self.lastLabel.setWordWrap(True); self.lastLabel.setTextFormat(Qt.RichText)
-            v4.addWidget(self.lastLabel)
-            lay.addWidget(c4)
-
-            # ---------- 日志 ----------
-            c5, v5 = self.card("今日日志")
-            lr = QHBoxLayout()
-            bRef = QPushButton("刷新"); bOpen = QPushButton("打开日志目录")
-            bRef.setFixedWidth(80); bOpen.setFixedWidth(120)
-            lr.addStretch(1); lr.addWidget(bRef); lr.addWidget(bOpen)
-            v5.addLayout(lr)
-            self.logView = QPlainTextEdit(); self.logView.setReadOnly(True); self.logView.setFixedHeight(150)
-            v5.addWidget(self.logView)
-            lay.addWidget(c5)
-
-            # ---------- 底部进度 ----------
-            self.prog = QProgressBar(); self.prog.setRange(0, 1); self.prog.setValue(0)
+            # ---------- 进度条 ----------
+            self.prog = QProgressBar()
+            self.prog.setRange(0, 1)
+            self.prog.setValue(0)
             self.prog.setTextVisible(False)
-            lay.addWidget(self.prog)
+            self.prog.setFixedHeight(3)
+            vbox.addWidget(self.prog)
 
-            scroll.setWidget(root)
-            self.setCentralWidget(scroll)
+            # ---------- 主体双列 ----------
+            body = QWidget()
+            bh = QHBoxLayout(body)
+            bh.setContentsMargins(28, 22, 28, 18)
+            bh.setSpacing(20)
+            left = QVBoxLayout()
+            left.setSpacing(18)
+            right = QVBoxLayout()
+            right.setSpacing(18)
 
+            # == 左列：签到中心 ==
+            cardSign, laySign = make_card()
+            topSign = QHBoxLayout()
+            hSign = QLabel("签到中心")
+            hSign.setObjectName("h2")
+            topSign.addWidget(hSign)
+            self.lastMeta = QLabel("")
+            self.lastMeta.setObjectName("faint")
+            topSign.addStretch(1)
+            topSign.addWidget(self.lastMeta)
+            laySign.addLayout(topSign)
+            self.accBox = QVBoxLayout()
+            self.accBox.setSpacing(10)
+            accWrap = QWidget()
+            accWrap.setLayout(self.accBox)
+            laySign.addWidget(accWrap, 1)
+            self.btnNow = QPushButton("立即签到")
+            self.btnNow.setObjectName("cta")
+            self.btnNow.setFixedHeight(52)
+            self.btnNow.setCursor(Qt.PointingHandCursor)
+            laySign.addWidget(self.btnNow)
+            self.hint = QLabel("为全部账号签到（会请求一次管理员授权）")
+            self.hint.setObjectName("faint")
+            self.hint.setAlignment(Qt.AlignCenter)
+            laySign.addWidget(self.hint)
+            left.addWidget(cardSign, 1)
+
+            # == 右列：自动签到设置 ==
+            cardCfg, layCfg = make_card("自动签到")
+            layCfg.setSpacing(11)
+            self.tgBoot = Toggle()
+            self.tgBackups = Toggle()
+            layCfg.addWidget(toggle_row("开机 / 登录时自动签到一次", self.tgBoot))
+            layCfg.addWidget(toggle_row("同时签到历史切换过的账号", self.tgBackups))
+            subT = QLabel("每日签到时间")
+            subT.setObjectName("sub")
+            layCfg.addWidget(subT)
+            self.chipGrid = QGridLayout()
+            self.chipGrid.setSpacing(8)
+            self.chipGrid.setColumnStretch(4, 1)
+            layCfg.addLayout(self.chipGrid)
+            self.times = []
+            addRow = QHBoxLayout()
+            addRow.setSpacing(8)
+            self.timeEdit = QLineEdit("12:00")
+            self.timeEdit.setFixedWidth(96)
+            self.timeEdit.setPlaceholderText("HH:mm")
+            bAdd = QPushButton("＋ 添加")
+            bAdd.setCursor(Qt.PointingHandCursor)
+            addRow.addWidget(self.timeEdit)
+            addRow.addWidget(bAdd)
+            addRow.addStretch(1)
+            layCfg.addLayout(addRow)
+            saveRow = QHBoxLayout()
+            self.btnSave = QPushButton("保存设置")
+            self.btnSave.setObjectName("save")
+            self.btnSave.setFixedSize(128, 40)
+            self.btnSave.setCursor(Qt.PointingHandCursor)
+            saveRow.addStretch(1)
+            saveRow.addWidget(self.btnSave)
+            layCfg.addLayout(saveRow)
+            right.addWidget(cardCfg)
+
+            # == 右列：今日日志 ==
+            cardLog, layLog = make_card()
+            topLog = QHBoxLayout()
+            topLog.setSpacing(6)
+            hLog = QLabel("今日日志")
+            hLog.setObjectName("h2")
+            topLog.addWidget(hLog)
+            topLog.addStretch(1)
+            bRef = QPushButton("刷新")
+            bRef.setObjectName("tiny")
+            bOpen = QPushButton("打开目录")
+            bOpen.setObjectName("tiny")
+            for b in (bRef, bOpen):
+                b.setCursor(Qt.PointingHandCursor)
+            topLog.addWidget(bRef)
+            topLog.addWidget(bOpen)
+            layLog.addLayout(topLog)
+            self.logView = QPlainTextEdit()
+            self.logView.setReadOnly(True)
+            layLog.addWidget(self.logView, 1)
+            right.addWidget(cardLog, 1)
+
+            bh.addLayout(left, 11)
+            bh.addLayout(right, 9)
+            vbox.addWidget(body, 1)
+
+            # ---------- 事件 ----------
             bAdd.clicked.connect(self.add_time)
-            bDel.clicked.connect(lambda: self.timeList.takeItem(self.timeList.currentRow()))
             self.btnSave.clicked.connect(self.save_settings)
             self.btnNow.clicked.connect(self.checkin_now)
             bRef.clicked.connect(self.refresh_all)
@@ -579,24 +809,33 @@ def run_gui():
             cfg = load_config()
             self.tgBoot.setChecked(cfg["EnableBoot"])
             self.tgBackups.setChecked(cfg["IncludeBackups"])
-            for t in cfg["Times"]:
-                self.timeList.addItem(t)
+            self.times = list(cfg["Times"])
+            self.rebuild_chips()
             self.refresh_all()
 
-        def card(self, title):
-            f = QFrame(); f.setObjectName("card")
-            sh = QGraphicsDropShadowEffect()
-            sh.setBlurRadius(18); sh.setOffset(0, 3); sh.setColor(QColor(0, 0, 0, 70))
-            f.setGraphicsEffect(sh)
-            v = QVBoxLayout(f); v.setContentsMargins(18, 14, 18, 16); v.setSpacing(10)
-            h = QLabel(title); h.setObjectName("h")
-            v.addWidget(h)
-            return f, v
+        # ---------- 时间点 chips ----------
+        def rebuild_chips(self):
+            while self.chipGrid.count():
+                it = self.chipGrid.takeAt(0)
+                if it.widget():
+                    it.widget().deleteLater()
+            items = sorted(self.times)
+            if not items:
+                empty = QLabel("未设置定时时间")
+                empty.setObjectName("faint")
+                self.chipGrid.addWidget(empty, 0, 0, Qt.AlignLeft)
+                return
+            for i, t in enumerate(items):
+                b = QPushButton("%s    ✕" % t)
+                b.setObjectName("chip")
+                b.setCursor(Qt.PointingHandCursor)
+                b.clicked.connect(lambda _=False, tt=t: self.remove_time(tt))
+                self.chipGrid.addWidget(b, i // 4, i % 4, Qt.AlignLeft)
 
-        def busy(self, on):
-            self.prog.setRange(0, 0 if on else 1)
-            if not on:
-                self.prog.setValue(0)
+        def remove_time(self, t):
+            if t in self.times:
+                self.times.remove(t)
+            self.rebuild_chips()
 
         def add_time(self):
             t = self.timeEdit.text().strip()
@@ -605,46 +844,77 @@ def run_gui():
                 return
             hh, mm = t.split(":")
             t = "%02d:%s" % (int(hh), mm)
-            if self.timeList.findItems(t, Qt.MatchExactly):
-                return
-            self.timeList.addItem(t)
+            if t not in self.times:
+                self.times.append(t)
+                self.rebuild_chips()
 
         def collect_times(self):
-            return sorted(self.timeList.item(i).text() for i in range(self.timeList.count()))
+            return sorted(self.times)
+
+        # ---------- 账号行 ----------
+        def set_accounts(self, rows):
+            while self.accBox.count():
+                it = self.accBox.takeAt(0)
+                if it.widget():
+                    it.widget().deleteLater()
+            if not rows:
+                empty = QLabel("未发现本机 WorkBuddy 账号")
+                empty.setObjectName("faint")
+                empty.setAlignment(Qt.AlignCenter)
+                self.accBox.addWidget(empty)
+                return
+            for name, backup, msg, ok in rows:
+                w = QFrame()
+                w.setObjectName("accRow")
+                w.setFixedHeight(52)
+                h = QHBoxLayout(w)
+                h.setContentsMargins(16, 0, 16, 0)
+                h.setSpacing(10)
+                dot = QLabel()
+                col = C["GREEN"] if ok else (C["FAINT"] if ok is None else C["RED"])
+                dot.setStyleSheet("background:%s; border-radius:5px; min-width:10px; max-width:10px;"
+                                  "min-height:10px; max-height:10px;" % col)
+                h.addWidget(dot)
+                nm = QLabel(name)
+                nm.setStyleSheet("font-size:13.5px;")
+                h.addWidget(nm)
+                if backup:
+                    h.addWidget(badge("历史", C["FAINT"]))
+                h.addStretch(1)
+                ml = QLabel(msg or "—")
+                msg_col = C["GREEN"] if ok else (C["RED"] if ok is False else C["FAINT"])
+                ml.setStyleSheet("color:%s; font-size:11.5px;" % msg_col)
+                if msg:
+                    ml.setToolTip(msg)
+                h.addWidget(ml)
+                self.accBox.addWidget(w)
 
         def refresh_all(self):
             try:
-                if os.path.exists(ACCOUNTS):
-                    with open(ACCOUNTS, encoding="utf-8-sig") as f:
-                        lst = json.load(f)
-                    if lst:
-                        rows = []
-                        for a in lst:
-                            chip = (' <span style="color:%s; font-size:11px;">[历史]</span>' % C["YELLOW"]) if a.get("backup") else ""
-                            rows.append('<span style="color:%s;">●</span> %s%s' % (C["GREEN"], a["name"], chip))
-                        self.accLabel.setText("<br>".join(rows))
-                    else:
-                        self.accLabel.setText("未发现账号")
-                else:
-                    accs = find_accounts(False)
-                    self.accLabel.setText("<br>".join(
-                        '<span style="color:%s;">●</span> %s' % (C["GREEN"], a["name"]) for a in accs) or "未发现账号")
-            except Exception as e:
-                self.accLabel.setText("读取失败: %s" % e)
-            try:
-                with open(LASTRUN, encoding="utf-8-sig") as f:
-                    r = json.load(f)
-                lines = ['<span style="color:%s;">%s</span>' % (C["SUB"], r.get("time", ""))]
-                for x in r.get("results", []):
-                    col = C["GREEN"] if x.get("ok") else C["RED"]
-                    mark = "✔" if x.get("ok") else "✖"
-                    lines.append('<span style="color:%s;">%s</span> %s: %s' % (col, mark, x.get("user"), x.get("msg")))
-                self.lastLabel.setText("<br>".join(lines))
+                lst = read_state("accounts.json")
+                names = [a.get("name", "") for a in (lst or [])]
+                stale = any(("wbEncrypted" in n) or ("envelope" in n) or (len(n) > 48) for n in names)
+                if not lst or stale:
+                    cfg = load_config()
+                    lst = find_accounts(cfg["IncludeBackups"])
+                    save_accounts(lst)
             except Exception:
-                self.lastLabel.setText("暂无运行记录")
-            ex, msg = query_task_exists()
-            col = C["GREEN"] if ex else C["SUB"]
-            self.taskLabel.setText('<span style="color:%s;">计划任务：%s</span>' % (col, msg))
+                lst = []
+            results = {}
+            rtime = ""
+            try:
+                r = read_state("last-run.json") or {}
+                rtime = r.get("time", "")
+                results = {x.get("user"): x for x in r.get("results", [])}
+            except Exception:
+                pass
+            rows = []
+            for a in lst or []:
+                r = results.get(a.get("name"))
+                rows.append((a.get("name", "?"), bool(a.get("backup")),
+                             (r or {}).get("msg"), (r or {}).get("ok") if r else None))
+            self.set_accounts(rows)
+            self.lastMeta.setText(("上次签到  " + rtime) if rtime else "")
             lf = os.path.join(LOG_DIR, "checkin-%s.log" % datetime.date.today().isoformat())
             if os.path.exists(lf):
                 with open(lf, encoding="utf-8", errors="replace") as f:
@@ -652,16 +922,26 @@ def run_gui():
             else:
                 self.logView.setPlainText("今日暂无日志")
 
+        def busy(self, on):
+            self.prog.setRange(0, 0 if on else 1)
+            if not on:
+                self.prog.setValue(0)
+
+        # ---------- 保存设置 ----------
         def save_settings(self):
             cfg = {"EnableBoot": self.tgBoot.isChecked(),
                    "Times": self.collect_times(),
                    "IncludeBackups": self.tgBackups.isChecked()}
-            save_config(cfg)
+            try:
+                save_config(cfg)   # 普通用户可能无权写 ProgramData，失败由提权流程兜底
+            except Exception:
+                pass
+            cfg_b64 = base64.b64encode(json.dumps(cfg, ensure_ascii=False).encode("utf-8")).decode()
             self.btnSave.setEnabled(False); self.btnSave.setText("应用中…"); self.busy(True)
             def work():
                 if is_admin():
-                    return apply_tasks() == 0
-                if not run_elevated("--apply"):
+                    return apply_tasks(cfg) == 0
+                if not run_elevated("--apply --config-json " + cfg_b64):
                     return "cancel"
                 return wait_result(SETUP_RES) or False
             self._w1 = Worker(work)
@@ -679,9 +959,10 @@ def run_gui():
             self._w1.done.connect(finish)
             self._w1.start()
 
+        # ---------- 立即签到 ----------
         def checkin_now(self):
             self.btnNow.setEnabled(False); self.btnNow.setText("签到中…"); self.busy(True)
-            self.hint.setText("正在以管理员身份为全部账号签到，请稍候…")
+            self.hint.setText("正在为全部账号签到，请稍候…")
             def work():
                 if is_admin():
                     return run_checkin(1) == 0
@@ -696,7 +977,7 @@ def run_gui():
                 elif res is False:
                     self.hint.setText("签到执行超时或失败，请查看日志")
                 else:
-                    self.hint.setText("签到流程已完成，结果见下方")
+                    self.hint.setText("签到流程已完成，结果见上方账号列表")
                 self.refresh_all()
             self._w2.done.connect(finish)
             self._w2.start()
@@ -708,7 +989,6 @@ def run_gui():
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
     app.setWindowIcon(QIcon(resource_path("app.ico")))
-    # 单实例
     from PySide6.QtCore import QSharedMemory
     shm = QSharedMemory("WorkBuddyCheckinGUI")
     if not shm.create(1):
@@ -725,13 +1005,19 @@ def main():
     p.add_argument("--checkin", action="store_true", help="无头模式：签到全部账号")
     p.add_argument("--apply", action="store_true", help="无头模式：注册计划任务")
     p.add_argument("--scan", action="store_true", help="无头模式：导出账号列表")
+    p.add_argument("--config-json", default="", help="（内部）base64 编码的新配置，与 --apply 同用")
     a = p.parse_args()
+    ensure_tool_dir_writable()
+    cfg_arg = None
+    if a.config_json:
+        try:
+            cfg_arg = json.loads(base64.b64decode(a.config_json).decode("utf-8"))
+        except Exception:
+            cfg_arg = None
     if a.checkin:
-        rc = run_checkin()
-        write_setup_result(rc == 0, "签到流程已执行，详见日志")
-        sys.exit(rc)
+        sys.exit(run_checkin())
     if a.apply:
-        sys.exit(apply_tasks())
+        sys.exit(apply_tasks(cfg_arg))
     if a.scan:
         cfg = load_config()
         save_accounts(find_accounts(cfg["IncludeBackups"]))
