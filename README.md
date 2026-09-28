@@ -90,6 +90,12 @@ pyinstaller --noconfirm --onefile --windowed \
 
 ## 版本说明
 
+- **v1.4.1** — 计划任务可靠性修复与旧版清理：任务设置改为「电池模式可运行 / 切电池
+  不中断 / 错过的定时点自动补跑」（此前 Windows 默认的电池限制会导致定时点上任务被拒，
+  错误码 0x800710E0）；普通用户运行时日志/状态同时镜像到
+  `%LOCALAPPDATA%\WorkBuddyCheckin`，GUI 读取两处较新者；合并迁移任务为单一
+  `WorkBuddy-AutoCheckin`（每天 00:00/12:00 + 登录补跑）；删除全部旧版
+  （PowerShell 版脚本、旧系统任务、旧 exe）。
 - **v1.4.0** — UI 全面重做为「清爽浅色」风格：无边框白色卡片 + 柔和投影 + 大留白，
   飞书/Notion 式观感；仪表盘双列布局（签到中心 / 自动签到 / 今日日志），时间点胶囊、
   账号行内联签到结果（按结果着色）；修复容器背景补丁、普通用户下状态文件写入失败
@@ -100,7 +106,7 @@ pyinstaller --noconfirm --onefile --windowed \
   无法解密时跳过该账号并给出明确错误；修复 GUI 无写权限时保存设置失败、
   `--checkin` 与 `--apply` 结果文件互相干扰等问题。
 - **v1.1.0** — PySide6 GUI、多时间点定时签到、开机自启。
-- **v1.0.0** — PowerShell 版（已废弃，见 `WorkBuddy-Checkin*.ps1`）。
+- **v1.0.0** — PowerShell 版（已废弃并从本机移除）。
 
 ## License
 

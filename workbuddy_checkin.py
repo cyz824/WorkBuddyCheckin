@@ -9,7 +9,7 @@ import sys, os, json, time, ctypes, argparse, datetime, subprocess, tempfile, re
 APP_NAME   = "WorkBuddy-AutoCheckin"
 MIGRATION_TASKS = ["WorkBuddy-AutoCheckin-User1", "WorkBuddy-AutoCheckin-User2"]   # 修复期临时任务，注册主任务后自动清理
 APP_TITLE  = "WorkBuddy 签到助手"
-APP_VER    = "1.4.0"
+APP_VER    = "1.4.1"
 APP_ID     = "WorkBuddy.CheckinAssistant"   # 任务栏图标分组
 TOOL_DIR   = r"C:\ProgramData\WorkBuddyCheckin"
 USER_TOOL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "WorkBuddyCheckin")
@@ -24,7 +24,12 @@ EP_CHECKIN = "/billing/meter/daily-checkin"
 EP_REFRESH = "/auth/token/refresh"
 SKIP_USERS = {"Public", "Default", "Default User", "All Users"}
 
-os.makedirs(LOG_DIR, exist_ok=True)
+USER_LOG_DIR = os.path.join(USER_TOOL_DIR, "logs")
+
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except Exception:
+    pass
 
 def ensure_tool_dir_writable():
     """ProgramData 下的工具目录常由 SYSTEM/管理员先创建，普通用户会写失败。
@@ -149,15 +154,23 @@ def wb_wrap(new_value, old_field):
         return new_value
 
 # ---------------- 日志 ----------------
+def today_log_files():
+    """今日日志的候选路径（ProgramData 主副本 + 用户镜像）"""
+    name = "checkin-%s.log" % datetime.date.today().isoformat()
+    return [os.path.join(LOG_DIR, name), os.path.join(USER_LOG_DIR, name)]
+
 def log(msg, lvl="INFO"):
     line = "[%s] [%s] %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), lvl, msg)
     print(line, flush=True)
-    try:
-        lf = os.path.join(LOG_DIR, "checkin-%s.log" % datetime.date.today().isoformat())
-        with open(lf, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    # ProgramData 常被管理员/SYSTEM 占有，普通用户写失败静默；
+    # 镜像到用户目录，保证用户级计划任务的运行也有日志可查
+    for lf in today_log_files():
+        try:
+            os.makedirs(os.path.dirname(lf), exist_ok=True)
+            with open(lf, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 # ---------------- 配置 ----------------
 def load_config():
@@ -804,7 +817,9 @@ def run_gui():
             self.btnSave.clicked.connect(self.save_settings)
             self.btnNow.clicked.connect(self.checkin_now)
             bRef.clicked.connect(self.refresh_all)
-            bOpen.clicked.connect(lambda: os.startfile(LOG_DIR))
+            bOpen.clicked.connect(lambda: os.startfile(
+                next((os.path.dirname(p) for p in today_log_files() if os.path.exists(p)),
+                     LOG_DIR if os.path.isdir(LOG_DIR) else USER_LOG_DIR)))
 
             cfg = load_config()
             self.tgBoot.setChecked(cfg["EnableBoot"])
@@ -915,8 +930,16 @@ def run_gui():
                              (r or {}).get("msg"), (r or {}).get("ok") if r else None))
             self.set_accounts(rows)
             self.lastMeta.setText(("上次签到  " + rtime) if rtime else "")
-            lf = os.path.join(LOG_DIR, "checkin-%s.log" % datetime.date.today().isoformat())
-            if os.path.exists(lf):
+            # 读 ProgramData/用户镜像中较新的今日日志（普通用户写不了 ProgramData 时有镜像兜底）
+            lf, lm = None, -1.0
+            for p in today_log_files():
+                try:
+                    m = os.path.getmtime(p)
+                    if m > lm:
+                        lf, lm = p, m
+                except Exception:
+                    continue
+            if lf:
                 with open(lf, encoding="utf-8", errors="replace") as f:
                     self.logView.setPlainText("".join(f.readlines()[-80:]))
             else:
